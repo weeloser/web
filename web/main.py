@@ -8,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
 import uvicorn
 
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*', ping_timeout=60)
+# Увеличиваем таймаут и разрешаем большие пакеты
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*', ping_timeout=60, max_http_buffer_size=1e7)
 app = FastAPI()
 socket_app = socketio.ASGIApp(sio, app)
 
@@ -22,7 +23,9 @@ app.add_middleware(
 
 templates = Jinja2Templates(directory="templates")
 
+# Хранилище: room_id -> { sid: user_info }
 rooms = defaultdict(dict)
+# Метаданные: room_id -> { locked: bool, banned: {ip: time}, muted: {ip: time} }
 room_meta = defaultdict(lambda: {'locked': False, 'banned': {}, 'muted': {}})
 
 def generate_room_code():
@@ -33,11 +36,11 @@ def generate_room_code():
 
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request, "room_id": ""})
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/{room_id}")
 async def room(request: Request, room_id: str):
-    return templates.TemplateResponse("index.html", {"request": request, "room_id": room_id})
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/create_code")
 async def create_code():
@@ -46,37 +49,43 @@ async def create_code():
 
 @sio.event
 async def connect(sid, environ):
+    # Пытаемся достать реальный IP за прокси
     headers = dict(environ.get('asgi.scope', {}).get('headers', []))
     x_forwarded_for = None
     for k, v in headers.items():
         if k == b'x-forwarded-for':
             x_forwarded_for = v.decode()
             break
+    
+    # Fallback на REMOTE_ADDR
     client_ip = x_forwarded_for if x_forwarded_for else environ.get('REMOTE_ADDR')
     await sio.save_session(sid, {'ip': client_ip})
 
 @sio.event
 async def join_room(sid, data):
-    room_id = data['room']
+    room_id = str(data['room']).strip().lower() # Нормализация ID комнаты
     
     session = await sio.get_session(sid)
     client_ip = session.get('ip', 'unknown')
-    
     current_time = time.time()
     
+    # 1. Проверка банов
     if room_id in room_meta:
         banned = room_meta[room_id]['banned']
+        # Очистка старых банов
+        for ip in list(banned.keys()):
+            if current_time > banned[ip]:
+                del banned[ip]
+                
         if client_ip in banned:
-            if current_time < banned[client_ip]:
-                await sio.emit('error', {'message': 'Вы забанены в этой комнате'}, to=sid)
-                return
-            else:
-                del banned[client_ip]
-
-        if room_meta[room_id]['locked']:
-            await sio.emit('error', {'message': 'Комната закрыта (Private)'}, to=sid)
+            await sio.emit('error', {'message': f'Вы забанены. Осталось: {int(banned[client_ip] - current_time)} сек.'}, to=sid)
             return
 
+        if room_meta[room_id]['locked']:
+            await sio.emit('error', {'message': 'Комната закрыта администратором'}, to=sid)
+            return
+
+    # 2. Определение админа
     is_admin = len(rooms[room_id]) == 0
     
     user_info = {
@@ -89,9 +98,11 @@ async def join_room(sid, data):
         'id': sid
     }
     
+    # 3. Вход
     rooms[room_id][sid] = user_info
     await sio.enter_room(sid, room_id)
     
+    # 4. Рассылка событий
     await sio.emit('user_joined', {'sid': sid, **user_info}, room=room_id, skip_sid=sid)
     
     existing_users = []
@@ -104,22 +115,23 @@ async def join_room(sid, data):
     if is_admin:
         await sio.emit('set_admin', {'is_admin': True}, to=sid)
 
-    # Проверка глобального мута при входе
+    # 5. Проверка мута
     if client_ip in room_meta[room_id]['muted']:
         mute_until = room_meta[room_id]['muted'][client_ip]
         if current_time < mute_until:
              await sio.emit('admin_command', {'command': 'mute_force', 'duration': mute_until - current_time}, to=sid)
+        else:
+             del room_meta[room_id]['muted'][client_ip]
 
 @sio.event
 async def signal(sid, data):
     target_sid = data['target']
-    if target_sid in rooms.get(data.get('room', ''), {}) or \
-       any(target_sid in r for r in rooms.values()):
-        await sio.emit('signal', {
-            'sender': sid,
-            'type': data['type'],
-            'data': data['data']
-        }, to=target_sid)
+    # Отправляем сигнал только если цель существует
+    await sio.emit('signal', {
+        'sender': sid,
+        'type': data['type'],
+        'data': data['data']
+    }, to=target_sid)
 
 @sio.event
 async def state_change(sid, data):
@@ -141,10 +153,12 @@ async def reaction(sid, data):
 async def chat_message(sid, data):
     room_id = data['room']
     user = rooms[room_id].get(sid, {'name': 'Unknown'})
+    # Обрезаем длинные сообщения
+    text = data['text'][:200]
     await sio.emit('chat_message', {
         'sid': sid,
         'name': user['name'],
-        'text': data['text'],
+        'text': text,
         'time': time.strftime("%H:%M")
     }, room=room_id)
 
@@ -159,6 +173,7 @@ async def admin_action(sid, data):
     command = data['command']
     target_sid = data.get('target_sid')
     
+    # Strict check: is sender actually an admin in RAM?
     if not rooms[room_id].get(sid, {}).get('is_admin'):
         return
 
@@ -171,7 +186,7 @@ async def admin_action(sid, data):
             await sio.disconnect(target_sid)
 
     elif command == 'ban':
-        duration = data.get('duration', 5) * 60
+        duration = int(data.get('duration', 5)) * 60
         target_info = rooms[room_id].get(target_sid)
         if target_info:
             meta['banned'][target_info['ip']] = current_time + duration
@@ -179,7 +194,7 @@ async def admin_action(sid, data):
             await sio.disconnect(target_sid)
 
     elif command == 'mute':
-        duration = data.get('duration', 5) * 60
+        duration = int(data.get('duration', 5)) * 60
         target_info = rooms[room_id].get(target_sid)
         if target_info:
             meta['muted'][target_info['ip']] = current_time + duration
@@ -197,12 +212,14 @@ async def admin_action(sid, data):
 
 @sio.event
 async def disconnect(sid):
+    # Эффективный поиск комнаты, где был юзер
     for room_id in list(rooms.keys()):
         if sid in rooms[room_id]:
             del rooms[room_id][sid]
             await sio.emit('user_left', {'sid': sid}, room=room_id)
             if not rooms[room_id]:
                 del rooms[room_id]
+                # Метаданные храним еще немного или удаляем сразу (тут удаляем)
                 if room_id in room_meta:
                     del room_meta[room_id]
             break
